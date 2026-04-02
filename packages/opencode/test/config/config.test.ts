@@ -52,6 +52,12 @@ async function writeConfig(dir: string, config: object, name = "opencode.json") 
   await Filesystem.write(path.join(dir, name), JSON.stringify(config))
 }
 
+async function writeFragment(dir: string, name: string, config: object | string) {
+  const cfg = path.join(dir, "config.d")
+  await fs.mkdir(cfg, { recursive: true })
+  await Filesystem.write(path.join(cfg, name), typeof config === "string" ? config : JSON.stringify(config))
+}
+
 async function check(map: (dir: string) => string) {
   if (process.platform !== "win32") return
   await using globalTmp = await tmpdir()
@@ -200,6 +206,212 @@ test("jsonc overrides json in the same directory", async () => {
       expect(config.username).toBe("base")
     },
   })
+})
+
+test("loads global config.d fragments after main config", async () => {
+  const install = spyOn(Npm, "install").mockResolvedValue(undefined)
+  await using globalTmp = await tmpdir()
+  await using tmp = await tmpdir()
+  const prev = Global.Path.config
+  ;(Global.Path as { config: string }).config = globalTmp.path
+  await Config.invalidate()
+
+  try {
+    await writeConfig(globalTmp.path, {
+      $schema: "https://opencode.ai/config.json",
+      model: "test/base",
+      username: "base-user",
+    })
+    await writeFragment(globalTmp.path, "10-user.jsonc", {
+      username: "fragment-user",
+      permission: {
+        bash: {
+          "git status *": "allow",
+        },
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const config = await Config.get()
+        expect(config.model).toBe("test/base")
+        expect(config.username).toBe("fragment-user")
+        expect(config.permission?.bash).toEqual({
+          "git status *": "allow",
+        })
+      },
+    })
+  } finally {
+    install.mockRestore()
+    await Instance.disposeAll()
+    ;(Global.Path as { config: string }).config = prev
+    await Config.invalidate()
+  }
+})
+
+test("loads .opencode config.d fragments in alphabetical order", async () => {
+  const install = spyOn(Npm, "install").mockResolvedValue(undefined)
+  try {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        const cfg = path.join(dir, ".opencode")
+        await fs.mkdir(cfg, { recursive: true })
+        await writeConfig(
+          cfg,
+          {
+            $schema: "https://opencode.ai/config.json",
+            username: "main-user",
+            permission: {
+              bash: {
+                "git status *": "allow",
+                "git diff *": "allow",
+                "npm test *": "ask",
+                "docker inspect *": "deny",
+              },
+            },
+            plugin: ["main-plugin"],
+            instructions: ["main.md"],
+          },
+          "opencode.json",
+        )
+        await writeFragment(cfg, "10-base.jsonc", {
+          permission: {
+            bash: {
+              "pytest *": "allow",
+            },
+          },
+          plugin: ["base-plugin"],
+          instructions: ["base.md"],
+        })
+        await writeFragment(cfg, "20-override.json", {
+          username: "fragment-user",
+          permission: {
+            bash: {
+              "npm test *": "allow",
+              "docker inspect *": "ask",
+            },
+          },
+          plugin: ["extra-plugin"],
+          instructions: ["extra.md"],
+        })
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const config = await Config.get()
+        expect(config.username).toBe("fragment-user")
+        expect(config.permission?.bash).toEqual({
+          "git status *": "allow",
+          "git diff *": "allow",
+          "npm test *": "allow",
+          "docker inspect *": "ask",
+          "pytest *": "allow",
+        })
+        expect(config.plugin?.some((item) => item.includes("main-plugin"))).toBe(true)
+        expect(config.plugin?.some((item) => item.includes("base-plugin"))).toBe(true)
+        expect(config.plugin?.some((item) => item.includes("extra-plugin"))).toBe(true)
+        expect(config.instructions).toEqual(["main.md", "base.md", "extra.md"])
+      },
+    })
+  } finally {
+    install.mockRestore()
+  }
+})
+
+test("supports env and file substitutions in config.d fragments", async () => {
+  const install = spyOn(Npm, "install").mockResolvedValue(undefined)
+  const prev = process.env.TEST_CONFIG_D_VAR
+  process.env.TEST_CONFIG_D_VAR = "test-user"
+
+  try {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        const cfg = path.join(dir, ".opencode")
+        await fs.mkdir(cfg, { recursive: true })
+        await fs.mkdir(path.join(cfg, "config.d"), { recursive: true })
+        await Filesystem.write(path.join(cfg, "config.d", "secret.txt"), "test/model")
+        await writeFragment(
+          cfg,
+          "10-subst.jsonc",
+          `{
+          "$schema": "https://opencode.ai/config.json",
+          "username": "{env:TEST_CONFIG_D_VAR}",
+          "model": "{file:secret.txt}"
+        }`,
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const config = await Config.get()
+        expect(config.username).toBe("test-user")
+        expect(config.model).toBe("test/model")
+      },
+    })
+  } finally {
+    install.mockRestore()
+    if (prev === undefined) delete process.env.TEST_CONFIG_D_VAR
+    else process.env.TEST_CONFIG_D_VAR = prev
+  }
+})
+
+test("throws for invalid config.d fragments", async () => {
+  const install = spyOn(Npm, "install").mockResolvedValue(undefined)
+  try {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        const cfg = path.join(dir, ".opencode")
+        await fs.mkdir(cfg, { recursive: true })
+        await writeFragment(cfg, "10-bad.json", "{ invalid json }")
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        await expect(Config.get()).rejects.toThrow()
+      },
+    })
+  } finally {
+    install.mockRestore()
+  }
+})
+
+test("loads config.d fragments from OPENCODE_CONFIG_DIR", async () => {
+  const install = spyOn(Npm, "install").mockResolvedValue(undefined)
+  const prev = process.env.OPENCODE_CONFIG_DIR
+
+  await using tmp = await tmpdir<string>({
+    init: async (dir) => {
+      const cfg = path.join(dir, "custom")
+      await fs.mkdir(cfg, { recursive: true })
+      await writeFragment(cfg, "10-user.json", {
+        username: "custom-user",
+      })
+      return cfg
+    },
+  })
+
+  process.env.OPENCODE_CONFIG_DIR = tmp.extra
+
+  try {
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const config = await Config.get()
+        expect(config.username).toBe("custom-user")
+      },
+    })
+  } finally {
+    install.mockRestore()
+    if (prev === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = prev
+  }
 })
 
 test("handles environment variable substitution", async () => {
@@ -746,6 +958,7 @@ test("does not try to install dependencies in read-only OPENCODE_CONFIG_DIR", as
 
   const prev = process.env.OPENCODE_CONFIG_DIR
   process.env.OPENCODE_CONFIG_DIR = tmp.extra
+  const install = spyOn(Npm, "install").mockResolvedValue(undefined)
 
   try {
     await Instance.provide({
@@ -755,6 +968,7 @@ test("does not try to install dependencies in read-only OPENCODE_CONFIG_DIR", as
       },
     })
   } finally {
+    install.mockRestore()
     if (prev === undefined) delete process.env.OPENCODE_CONFIG_DIR
     else process.env.OPENCODE_CONFIG_DIR = prev
   }
@@ -772,6 +986,10 @@ test("installs dependencies in writable OPENCODE_CONFIG_DIR", async () => {
   const prev = process.env.OPENCODE_CONFIG_DIR
   process.env.OPENCODE_CONFIG_DIR = tmp.extra
   const online = spyOn(Network, "online").mockReturnValue(false)
+  let hit = () => {}
+  const seen = new Promise<void>((resolve) => {
+    hit = resolve
+  })
   const install = spyOn(Npm, "install").mockImplementation(async (dir: string) => {
     const mod = path.join(dir, "node_modules", "@opencode-ai", "plugin")
     await fs.mkdir(mod, { recursive: true })
@@ -779,6 +997,7 @@ test("installs dependencies in writable OPENCODE_CONFIG_DIR", async () => {
       path.join(mod, "package.json"),
       JSON.stringify({ name: "@opencode-ai/plugin", version: "1.0.0" }),
     )
+    if (path.normalize(dir) === path.normalize(tmp.extra)) hit()
   })
 
   try {
@@ -786,9 +1005,9 @@ test("installs dependencies in writable OPENCODE_CONFIG_DIR", async () => {
       directory: tmp.path,
       fn: async () => {
         await Config.get()
-        await Config.waitForDependencies()
       },
     })
+    await seen
 
     expect(await Filesystem.exists(path.join(tmp.extra, "package.json"))).toBe(true)
     expect(await Filesystem.exists(path.join(tmp.extra, ".gitignore"))).toBe(true)
@@ -2072,6 +2291,38 @@ describe("OPENCODE_DISABLE_PROJECT_CONFIG", () => {
     }
   })
 
+  test("skips project config.d fragments when flag is set", async () => {
+    const install = spyOn(Npm, "install").mockResolvedValue(undefined)
+    const originalEnv = process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]
+    process.env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "true"
+
+    try {
+      await using tmp = await tmpdir({
+        init: async (dir) => {
+          const cfg = path.join(dir, ".opencode")
+          await fs.mkdir(cfg, { recursive: true })
+          await writeFragment(cfg, "10-user.json", {
+            username: "project-user",
+          })
+        },
+      })
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const config = await Config.get()
+          expect(config.username).not.toBe("project-user")
+        },
+      })
+    } finally {
+      install.mockRestore()
+      if (originalEnv === undefined) {
+        delete process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]
+      } else {
+        process.env["OPENCODE_DISABLE_PROJECT_CONFIG"] = originalEnv
+      }
+    }
+  })
+
   test("still loads global config when flag is set", async () => {
     const originalEnv = process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]
     process.env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "true"
@@ -2149,6 +2400,7 @@ describe("OPENCODE_DISABLE_PROJECT_CONFIG", () => {
   test("OPENCODE_CONFIG_DIR still works when flag is set", async () => {
     const originalDisable = process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]
     const originalConfigDir = process.env["OPENCODE_CONFIG_DIR"]
+    const install = spyOn(Npm, "install").mockResolvedValue(undefined)
 
     try {
       await using configDirTmp = await tmpdir({
@@ -2189,6 +2441,7 @@ describe("OPENCODE_DISABLE_PROJECT_CONFIG", () => {
         },
       })
     } finally {
+      install.mockRestore()
       if (originalDisable === undefined) {
         delete process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]
       } else {
