@@ -1039,6 +1039,18 @@ export namespace Config {
             .positive()
             .optional()
             .describe("Timeout in milliseconds for model context protocol (MCP) requests"),
+          paste_min_lines: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Minimum number of lines in pasted content before it is summarized (default: 3)"),
+          paste_min_length: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Minimum character length of pasted content before it is summarized (default: 150)"),
         })
         .optional(),
     })
@@ -1220,6 +1232,19 @@ export namespace Config {
           return yield* loadConfig(text, { path: filepath })
         })
 
+        const loadConfigDir = Effect.fnUntraced(function* (dir: string) {
+          const cfg = path.join(dir, "config.d")
+          if (!existsSync(cfg)) return [] as string[]
+          return (
+            yield* Effect.promise(() =>
+              Glob.scan("*.{json,jsonc}", {
+                cwd: cfg,
+                absolute: true,
+              }),
+            )
+          ).sort()
+        })
+
         const loadGlobal = Effect.fnUntraced(function* () {
           let result: Info = pipe(
             {},
@@ -1313,6 +1338,9 @@ export namespace Config {
 
           const global = yield* getGlobal()
           merge(Global.Path.config, global, "global")
+          for (const file of yield* loadConfigDir(Global.Path.config)) {
+            merge(file, yield* loadFile(file), "global")
+          }
 
           if (Flag.OPENCODE_CONFIG) {
             merge(Flag.OPENCODE_CONFIG, yield* loadFile(Flag.OPENCODE_CONFIG))
@@ -1345,6 +1373,12 @@ export namespace Config {
                 const source = path.join(dir, file)
                 log.debug(`loading config from ${source}`)
                 merge(source, yield* loadFile(source))
+                result.agent ??= {}
+                result.mode ??= {}
+                result.plugin ??= []
+              }
+              for (const file of yield* loadConfigDir(dir)) {
+                merge(file, yield* loadFile(file))
                 result.agent ??= {}
                 result.mode ??= {}
                 result.plugin ??= []

@@ -812,30 +812,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           nu: { args: ["-c", input.command] },
           fish: { args: ["-c", input.command] },
           zsh: {
-            args: [
-              "-l",
-              "-c",
-              `
-                __oc_cwd=$PWD
-                [[ -f ~/.zshenv ]] && source ~/.zshenv >/dev/null 2>&1 || true
-                [[ -f "\${ZDOTDIR:-$HOME}/.zshrc" ]] && source "\${ZDOTDIR:-$HOME}/.zshrc" >/dev/null 2>&1 || true
-                cd "$__oc_cwd"
-                eval ${JSON.stringify(input.command)}
-              `,
-            ],
+            args: ["-c", `eval ${JSON.stringify(input.command)}`],
           },
           bash: {
-            args: [
-              "-l",
-              "-c",
-              `
-                __oc_cwd=$PWD
-                shopt -s expand_aliases
-                [[ -f ~/.bashrc ]] && source ~/.bashrc >/dev/null 2>&1 || true
-                cd "$__oc_cwd"
-                eval ${JSON.stringify(input.command)}
-              `,
-            ],
+            args: ["-c", `eval ${JSON.stringify(input.command)}`],
           },
           cmd: { args: ["/c", input.command] },
           powershell: { args: ["-NoProfile", "-Command", input.command] },
